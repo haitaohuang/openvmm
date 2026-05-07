@@ -99,6 +99,190 @@ mod ioctl {
     ioctl_write_ptr!(kvm_set_guest_debug, KVMIO, 0x9b, kvm_guest_debug);
     ioctl_readwrite!(kvm_create_device, KVMIO, 0xe0, kvm_create_device);
     ioctl_write_ptr!(kvm_set_device_attr, KVMIO, 0xe1, kvm_device_attr);
+
+    // SEV / SEV-SNP ioctls (hackathon scaffolding for nested SNP support).
+    //
+    // KVM_MEMORY_ENCRYPT_OP is generic: caller passes a pointer to a
+    // `kvm_sev_cmd` whose `id` selects the sub-command (KVM_SEV_INIT2,
+    // KVM_SEV_SNP_LAUNCH_START, _UPDATE, _FINISH, ...).
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite!(kvm_memory_encrypt_op, KVMIO, 0xba, super::sev::kvm_sev_cmd);
+
+    // Memory APIs needed for a SNP guest (private memory via guest_memfd).
+    // - KVM_SET_USER_MEMORY_REGION2 (0x49) replaces SET_USER_MEMORY_REGION
+    //   and adds the guest_memfd / offset fields.
+    // - KVM_SET_MEMORY_ATTRIBUTES (0xd2) marks pages PRIVATE/SHARED.
+    // - KVM_CREATE_GUEST_MEMFD (0xd4) returns an fd backing private RAM.
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(
+        kvm_set_user_memory_region2,
+        KVMIO,
+        0x49,
+        super::sev::kvm_userspace_memory_region2
+    );
+    #[cfg(target_arch = "x86_64")]
+    ioctl_write_ptr!(
+        kvm_set_memory_attributes,
+        KVMIO,
+        0xd2,
+        super::sev::kvm_memory_attributes
+    );
+    #[cfg(target_arch = "x86_64")]
+    ioctl_readwrite!(
+        kvm_create_guest_memfd,
+        KVMIO,
+        0xd4,
+        super::sev::kvm_create_guest_memfd
+    );
+}
+
+/// Pre-upstream and modern (mainline 6.11+) SEV / SEV-SNP definitions for
+/// KVM. Mirrored from `linux/asm-x86/kvm.h`. Not yet wired up to the rest
+/// of openvmm — this module exists so that a follow-up patch can add the
+/// guest_memfd memory backend and the SNP launch sequence without first
+/// having to plumb in raw ioctl numbers.
+#[cfg(target_arch = "x86_64")]
+pub mod sev {
+    /// VM type passed to `KVM_CREATE_VM`. Selects the SEV-SNP architectural
+    /// VM. Requires `KVM_CAP_VM_TYPES` to advertise the bit.
+    pub const KVM_X86_DEFAULT_VM: u64 = 0;
+    pub const KVM_X86_SEV_VM: u64 = 2;
+    pub const KVM_X86_SEV_ES_VM: u64 = 3;
+    pub const KVM_X86_SNP_VM: u64 = 4;
+
+    /// Sub-command IDs for `KVM_MEMORY_ENCRYPT_OP` (`kvm_sev_cmd::id`).
+    pub const KVM_SEV_INIT: u32 = 0;
+    pub const KVM_SEV_ES_INIT: u32 = 1;
+    pub const KVM_SEV_LAUNCH_START: u32 = 2;
+    pub const KVM_SEV_INIT2: u32 = 22;
+    pub const KVM_SEV_SNP_LAUNCH_START: u32 = 100;
+    pub const KVM_SEV_SNP_LAUNCH_UPDATE: u32 = 101;
+    pub const KVM_SEV_SNP_LAUNCH_FINISH: u32 = 102;
+
+    /// Page-type values for `kvm_sev_snp_launch_update::ty`.
+    pub const KVM_SEV_SNP_PAGE_TYPE_NORMAL: u8 = 0x1;
+    pub const KVM_SEV_SNP_PAGE_TYPE_ZERO: u8 = 0x3;
+    pub const KVM_SEV_SNP_PAGE_TYPE_UNMEASURED: u8 = 0x4;
+    pub const KVM_SEV_SNP_PAGE_TYPE_SECRETS: u8 = 0x5;
+    pub const KVM_SEV_SNP_PAGE_TYPE_CPUID: u8 = 0x6;
+
+    /// Memory-attribute bit for `KVM_SET_MEMORY_ATTRIBUTES`.
+    pub const KVM_MEMORY_ATTRIBUTE_PRIVATE: u64 = 1 << 3;
+
+    /// Argument for `KVM_MEMORY_ENCRYPT_OP`. The interpretation of `data`
+    /// depends on `id`; e.g. for `KVM_SEV_SNP_LAUNCH_START` it is a pointer
+    /// to a `kvm_sev_snp_launch_start`.
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct kvm_sev_cmd {
+        pub id: u32,
+        pub _pad0: u32,
+        pub data: u64,
+        pub error: u32,
+        pub sev_fd: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct kvm_sev_init {
+        pub vmsa_features: u64,
+        pub flags: u32,
+        pub ghcb_version: u16,
+        pub _pad1: u16,
+        pub _pad2: [u32; 8],
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct kvm_sev_snp_launch_start {
+        pub policy: u64,
+        pub gosvw: [u8; 16],
+        pub flags: u16,
+        pub _pad0: [u8; 6],
+        pub _pad1: [u64; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct kvm_sev_snp_launch_update {
+        pub gfn_start: u64,
+        pub uaddr: u64,
+        pub len: u64,
+        pub ty: u8,
+        pub _pad0: u8,
+        pub flags: u16,
+        pub _pad1: u32,
+        pub _pad2: [u64; 4],
+    }
+
+    pub const KVM_SEV_SNP_FINISH_DATA_SIZE: usize = 32;
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug)]
+    pub struct kvm_sev_snp_launch_finish {
+        pub id_block_uaddr: u64,
+        pub id_auth_uaddr: u64,
+        pub id_block_en: u8,
+        pub auth_key_en: u8,
+        pub vcek_disabled: u8,
+        pub host_data: [u8; KVM_SEV_SNP_FINISH_DATA_SIZE],
+        pub _pad0: [u8; 3],
+        pub flags: u16,
+        pub _pad1: [u64; 4],
+    }
+
+    impl Default for kvm_sev_snp_launch_finish {
+        fn default() -> Self {
+            Self {
+                id_block_uaddr: 0,
+                id_auth_uaddr: 0,
+                id_block_en: 0,
+                auth_key_en: 0,
+                vcek_disabled: 0,
+                host_data: [0; KVM_SEV_SNP_FINISH_DATA_SIZE],
+                _pad0: [0; 3],
+                flags: 0,
+                _pad1: [0; 4],
+            }
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct kvm_create_guest_memfd {
+        pub size: u64,
+        pub flags: u64,
+        pub _reserved: [u64; 6],
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct kvm_memory_attributes {
+        pub address: u64,
+        pub size: u64,
+        pub attributes: u64,
+        pub flags: u64,
+    }
+
+    /// Replacement for `kvm_userspace_memory_region` that adds `guest_memfd`
+    /// and `guest_memfd_offset`. Used with `KVM_SET_USER_MEMORY_REGION2`.
+    #[repr(C)]
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct kvm_userspace_memory_region2 {
+        pub slot: u32,
+        pub flags: u32,
+        pub guest_phys_addr: u64,
+        pub memory_size: u64,
+        pub userspace_addr: u64,
+        pub guest_memfd_offset: u64,
+        pub guest_memfd: u32,
+        pub _pad1: u32,
+        pub _pad2: [u64; 14],
+    }
+
+    /// Flag bit for `kvm_userspace_memory_region2::flags` selecting the
+    /// guest_memfd-backed path.
+    pub const KVM_MEM_GUEST_MEMFD: u32 = 1 << 2;
 }
 
 #[derive(Error, Debug)]
@@ -260,16 +444,18 @@ impl Kvm {
     }
 
     pub fn new_vm(&self) -> Result<Partition> {
-        // On ARM, can request memory isolation which we don't use.
-        // For that, include the `KVM_VM_TYPE_ARM_PROTECTED` flag.
-        // Use 0 as the fallback machine type, which implies 40bit
-        // IPA on ARM64, and on x86_64 is the only option.
-        let vm_type = self.check_extension(KVM_CAP_ARM_VM_IPA_SIZE).unwrap_or(0);
+        self.new_vm_of_type(self.check_extension(KVM_CAP_ARM_VM_IPA_SIZE).unwrap_or(0) as u64)
+    }
 
+    /// Create a new VM of the requested architectural type. On x86_64 only
+    /// `KVM_X86_DEFAULT_VM` (0) is exercised by the rest of the codebase
+    /// today; this entry point exists so that the SNP scaffolding can pass
+    /// `KVM_X86_SNP_VM = 4`. See `vm/kvm/src/lib.rs::sev` for constants.
+    pub fn new_vm_of_type(&self, vm_type: u64) -> Result<Partition> {
         // SAFETY: Calling IOCTL as documented, with no special requirements.
         let vm = unsafe {
-            let fd =
-                ioctl::kvm_create_vm(self.as_fd().as_raw_fd(), vm_type).map_err(Error::CreateVm)?;
+            let fd = ioctl::kvm_create_vm(self.as_fd().as_raw_fd(), vm_type as i32)
+                .map_err(Error::CreateVm)?;
             File::from_raw_fd(fd)
         };
 
@@ -676,6 +862,123 @@ impl Partition {
             ioctl::kvm_get_clock(self.vm.as_raw_fd(), &mut clock).map_err(Error::GetRegs)?;
         }
         Ok(clock)
+    }
+
+    // -------------------------------------------------------------------
+    // SEV / SEV-SNP launch helpers (hackathon scaffolding).
+    //
+    // These wrap the host's `KVM_MEMORY_ENCRYPT_OP` ioctl with the modern
+    // (mainline 6.11+) SNP sub-commands and the `guest_memfd` family of
+    // memory-region calls. They are deliberately low-level and do NOT
+    // try to plumb through the existing `set_user_memory_region` paths;
+    // a real implementation needs an "encrypted" backend in
+    // `vm/vmcore/guestmem` first. See HACKATHON_FINDINGS.md.
+    // -------------------------------------------------------------------
+
+    /// Issue a `KVM_MEMORY_ENCRYPT_OP` with an arbitrary sub-command.
+    /// The caller fills in `cmd.id` and `cmd.data` (typically a pointer to
+    /// the matching `kvm_sev_*` struct).
+    #[cfg(target_arch = "x86_64")]
+    pub fn memory_encrypt_op(&self, cmd: &mut sev::kvm_sev_cmd) -> nix::Result<()> {
+        // SAFETY: Calling IOCTL as documented; the kernel only reads `cmd`
+        // on entry and writes `cmd.error` / `cmd.sev_fd` on return.
+        unsafe { ioctl::kvm_memory_encrypt_op(self.vm.as_raw_fd(), cmd)? };
+        Ok(())
+    }
+
+    /// `KVM_SEV_INIT2`: initialize the SEV-SNP context for this VM.
+    #[cfg(target_arch = "x86_64")]
+    pub fn sev_init2(&self, init: &sev::kvm_sev_init) -> nix::Result<i32> {
+        let mut cmd = sev::kvm_sev_cmd {
+            id: sev::KVM_SEV_INIT2,
+            data: init as *const _ as u64,
+            ..Default::default()
+        };
+        self.memory_encrypt_op(&mut cmd)?;
+        Ok(cmd.sev_fd as i32)
+    }
+
+    /// `KVM_SEV_SNP_LAUNCH_START`: begin the SNP launch sequence.
+    #[cfg(target_arch = "x86_64")]
+    pub fn snp_launch_start(&self, args: &sev::kvm_sev_snp_launch_start) -> nix::Result<()> {
+        let mut cmd = sev::kvm_sev_cmd {
+            id: sev::KVM_SEV_SNP_LAUNCH_START,
+            data: args as *const _ as u64,
+            ..Default::default()
+        };
+        self.memory_encrypt_op(&mut cmd)
+    }
+
+    /// `KVM_SEV_SNP_LAUNCH_UPDATE`: encrypt and measure a range of guest
+    /// pages, populating them from `uaddr` in the calling process.
+    #[cfg(target_arch = "x86_64")]
+    pub fn snp_launch_update(&self, args: &sev::kvm_sev_snp_launch_update) -> nix::Result<()> {
+        let mut cmd = sev::kvm_sev_cmd {
+            id: sev::KVM_SEV_SNP_LAUNCH_UPDATE,
+            data: args as *const _ as u64,
+            ..Default::default()
+        };
+        self.memory_encrypt_op(&mut cmd)
+    }
+
+    /// `KVM_SEV_SNP_LAUNCH_FINISH`: finalize the launch and lock in the
+    /// measurement. After this returns the guest is ready to run.
+    #[cfg(target_arch = "x86_64")]
+    pub fn snp_launch_finish(&self, args: &sev::kvm_sev_snp_launch_finish) -> nix::Result<()> {
+        let mut cmd = sev::kvm_sev_cmd {
+            id: sev::KVM_SEV_SNP_LAUNCH_FINISH,
+            data: args as *const _ as u64,
+            ..Default::default()
+        };
+        self.memory_encrypt_op(&mut cmd)
+    }
+
+    /// `KVM_CREATE_GUEST_MEMFD`: returns an fd that backs SNP private RAM.
+    /// The fd is returned as a raw `i32`; ownership is the caller's.
+    #[cfg(target_arch = "x86_64")]
+    pub fn create_guest_memfd(&self, size: u64, flags: u64) -> nix::Result<i32> {
+        let mut req = sev::kvm_create_guest_memfd {
+            size,
+            flags,
+            ..Default::default()
+        };
+        // SAFETY: Calling IOCTL as documented; kernel writes the fd into
+        // its return value, not into `req` for this op.
+        let fd = unsafe { ioctl::kvm_create_guest_memfd(self.vm.as_raw_fd(), &mut req)? };
+        Ok(fd)
+    }
+
+    /// `KVM_SET_USER_MEMORY_REGION2`: register a memory region that may be
+    /// backed by `guest_memfd` (when `flags` includes `KVM_MEM_GUEST_MEMFD`).
+    #[cfg(target_arch = "x86_64")]
+    #[expect(clippy::missing_safety_doc)]
+    pub unsafe fn set_user_memory_region2(
+        &self,
+        region: &sev::kvm_userspace_memory_region2,
+    ) -> nix::Result<()> {
+        // SAFETY: Caller is responsible for keeping the host-side mapping
+        // alive for the lifetime of the slot.
+        unsafe { ioctl::kvm_set_user_memory_region2(self.vm.as_raw_fd(), region)? };
+        Ok(())
+    }
+
+    /// `KVM_SET_MEMORY_ATTRIBUTES`: mark a GPA range as private or shared.
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_memory_attributes(
+        &self,
+        address: u64,
+        size: u64,
+        attributes: u64,
+    ) -> nix::Result<()> {
+        let attrs = sev::kvm_memory_attributes {
+            address,
+            size,
+            attributes,
+            flags: 0,
+        };
+        // SAFETY: Calling IOCTL as documented.
+        unsafe { ioctl::kvm_set_memory_attributes(self.vm.as_raw_fd(), &attrs)? };
+        Ok(())
     }
 }
 

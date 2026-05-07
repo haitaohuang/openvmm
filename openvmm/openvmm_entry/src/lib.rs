@@ -1280,6 +1280,7 @@ async fn vm_config_from_command_line(
 
         match isolation {
             cli_args::IsolationCli::Vbs => Some(openvmm_defs::config::IsolationType::Vbs),
+            cli_args::IsolationCli::Snp => Some(openvmm_defs::config::IsolationType::Snp),
         }
     } else {
         None

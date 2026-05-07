@@ -1648,6 +1648,9 @@ pub enum Vtl0LateMapPolicyCli {
 #[derive(Debug, Copy, Clone, ValueEnum)]
 pub enum IsolationCli {
     Vbs,
+    /// AMD SEV-SNP isolation (KVM backend, hackathon scaffolding only — not
+    /// yet fully implemented, see vmm_core/virt_kvm).
+    Snp,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
