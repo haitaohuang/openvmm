@@ -356,7 +356,7 @@ pub(crate) async fn spawn_kvm_vps(
     _tp: &AffinitizedThreadpool,
     vps: Vec<virt_kvm::KvmProcessorBinder>,
     runners: Vec<vmm_core::partition_unit::VpRunner>,
-    chipset: &vmm_core::vmotherboard_adapter::ChipsetPlusSynic,
+    chipset: &vmm_core::vmotherboard_adapter::AdaptedChipset,
     partition: Arc<dyn crate::partition::OpenhclPartition>,
 ) -> anyhow::Result<()> {
     // Wrapper that adds ProtobufSaveRestore to a Processor via its state

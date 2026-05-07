@@ -21,7 +21,6 @@ use hvdef::Vtl;
 use inspect::Inspect;
 use std::sync::Arc;
 use virt::PartitionCapabilities;
-use virt::Synic;
 use virt::irqcon::MsiRequest;
 
 /// The VM partition, abstracting over the virtualization backend.
@@ -60,8 +59,8 @@ pub trait OpenhclPartition: Send + Sync + Inspect {
     /// Asserts a debug interrupt on the given VTL.
     fn assert_debug_interrupt(&self, vtl: u8);
 
-    /// Returns the trait object for accessing the synic.
-    fn into_synic(self: Arc<Self>) -> Arc<dyn Synic>;
+    /// Returns the trait object for accessing the synic port interface.
+    fn into_synic(self: Arc<Self>) -> Arc<dyn vmcore::synic::SynicPortAccess>;
 
     /// Gets a line set target to trigger local APIC LINTs.
     ///
@@ -119,8 +118,8 @@ impl OpenhclPartition for virt_mshv_vtl::UhPartition {
         self.assert_debug_interrupt(vtl)
     }
 
-    fn into_synic(self: Arc<Self>) -> Arc<dyn Synic> {
-        self
+    fn into_synic(self: Arc<Self>) -> Arc<dyn vmcore::synic::SynicPortAccess> {
+        <Self as virt::Hv1>::synic(self.as_ref())
     }
 
     #[cfg(guest_arch = "x86_64")]
@@ -190,8 +189,8 @@ impl OpenhclPartition for virt_kvm::KvmPartition {
         // TODO: forward to KVM debug interrupt injection
     }
 
-    fn into_synic(self: Arc<Self>) -> Arc<dyn Synic> {
-        self
+    fn into_synic(self: Arc<Self>) -> Arc<dyn vmcore::synic::SynicPortAccess> {
+        <Self as virt::Hv1>::synic(self.as_ref())
     }
 
     #[cfg(guest_arch = "x86_64")]

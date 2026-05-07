@@ -2244,7 +2244,7 @@ async fn new_underhill_vm(
 
         #[cfg(feature = "virt_kvm")]
         {
-            let mut kvm_hv = virt_kvm::Kvm;
+            let mut kvm_hv = virt_kvm::Kvm::new()?;
             let kvm_proto = virt::Hypervisor::new_partition(
                 &mut kvm_hv,
                 virt::ProtoPartitionConfig {
@@ -2822,7 +2822,7 @@ async fn new_underhill_vm(
     let emuplat_adjust_gpa_range;
 
     let synic: Arc<dyn vmcore::synic::SynicPortAccess> =
-        Arc::new(virt::synic::SynicPorts::new(partition.clone().into_synic()));
+        partition.clone().into_synic();
 
     let mut chipset = vm_manifest_builder::VmManifestBuilder::new(
         match firmware_type {
@@ -2839,12 +2839,13 @@ async fn new_underhill_vm(
         },
     );
 
-    if with_serial {
-        chipset = chipset.with_serial(serial_inputs);
-        if env_cfg.emulated_serial_wait_for_rts {
-            chipset = chipset.with_serial_wait_for_rts();
-        }
-    }
+    // serial_inputs already consumed in the first chipset builder pass.
+
+
+
+
+
+
 
     if matches!(firmware_type, FirmwareType::Pcat) {
         // Use the stub floppy implementation for compatibility with existing
@@ -2874,6 +2875,8 @@ async fn new_underhill_vm(
     let vm_manifest_builder::VmChipsetResult {
         chipset,
         mut chipset_devices,
+        pci_chipset_devices: _,
+        capabilities: _,
     } = chipset
         .build()
         .context("failed to build chipset configuration")?;
