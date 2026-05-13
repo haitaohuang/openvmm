@@ -1573,17 +1573,22 @@ async fn vm_config_from_command_line(
 
     if let Some(vsock_path) = &opt.virtio_vsock_path {
         let listener = vsock_listener(Some(vsock_path))?.unwrap();
-        add_virtio_device(
-            VirtioBusCli::Auto,
-            virtio_resources::vsock::VirtioVsockHandle {
-                // The guest CID does not matter since the UDS relay does not use it. It just needs
-                // to be some non-reserved value for the guest to use.
-                guest_cid: 0x3,
-                base_path: vsock_path.clone(),
-                listener,
-            }
-            .into_resource(),
-        );
+        let resource: Resource<VirtioDeviceHandle> = virtio_resources::vsock::VirtioVsockHandle {
+            // The guest CID does not matter since the UDS relay does not use it. It just needs
+            // to be some non-reserved value for the guest to use.
+            guest_cid: 0x3,
+            base_path: vsock_path.clone(),
+            listener,
+        }
+        .into_resource();
+        if let Some(pcie_port) = &opt.virtio_vsock_pcie_port {
+            pcie_devices.push(PcieDeviceConfig {
+                port_name: pcie_port.clone(),
+                resource: VirtioPciDeviceHandle(resource).into_resource(),
+            });
+        } else {
+            add_virtio_device(VirtioBusCli::Auto, resource);
+        }
     }
 
     let mut cfg = Config {

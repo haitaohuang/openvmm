@@ -533,6 +533,12 @@ options:
     #[clap(long, value_name = "PATH")]
     pub virtio_vsock_path: Option<String>,
 
+    /// attach the virtio-vsock device to the specified PCIe port. Required for
+    /// SNP-isolated guests, since the SNP path does not support legacy PCI
+    /// virtio devices.
+    #[clap(long, value_name = "PORT", requires("virtio_vsock_path"))]
+    pub virtio_vsock_pcie_port: Option<String>,
+
     /// expose a virtio network with the given backend (dio | vmnic | tap |
     /// none)
     ///
