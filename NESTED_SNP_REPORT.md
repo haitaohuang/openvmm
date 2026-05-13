@@ -2,7 +2,7 @@
 
 **Author:** Copilot session `b5311a18-c841-40f6-a42f-8be7396d8ba2`
 **Date:** 2026-05-13 UTC
-**Status:** ✅ Success. A nested SEV-SNP guest boots inside OpenVMM on an Azure DCas_cc_v5 VM (Hyper-V L0) running the patched stock Ubuntu 25.10 kernel (6.17.0-23-generic + 18 patches).
+**Status:** ✅ Success. A nested SEV-SNP guest boots inside OpenVMM on an Azure DCas_cc_v5 VM (Hyper-V L0) running the patched stock Ubuntu 25.10 kernel (6.17.0-23-generic + 17 patches).
 
 ---
 
@@ -38,19 +38,21 @@ This document is the post-mortem of that loop: what the patches do, why they wer
 
 ## 3. Final patch stack on top of `linux-6.17.0-23.23`
 
-18 commits in the **minimal** functional stack, in apply order. (`git log --reverse`
+17 commits in the **minimal** functional stack, in apply order. (`git log --reverse`
 on `/datadrive/nested_openvmm/host-kernel-6.17/ubuntu-source/linux-6.17.0-23.23`,
-branch `master` HEAD `5fee34c93`. The actual git log additionally contains
+branch `master` HEAD `2a624399c`. The actual git log additionally contains
 4 early platform-PSP infrastructure commits — ACPI ASPT helper, Hyper-V PSP
 platform-device registration, PSP IRQ support, CCP bind to platform PSP —
 that are unchanged ports of jepio's series and not surfaced in the table.)
-Two earlier rows existed in previous revisions of this report:
+Three earlier rows existed in previous revisions of this report:
 the `b868e81ee` "soft-RMP fallback on WRMSR #GP" row (removed after build
-#10nob868 confirmed the fallback is dead code in the happy path), and the
+#10nob868 confirmed the fallback is dead code in the happy path), the
 `1b0402d1d` "Make virt_rmpupdate/virt_psmash WRMSR fault-safe" row (removed
 after build #11noextable confirmed the extable wrapper is dead code once
-SYSCFG.SNP_EN is set per-CPU). Both removed patches are preserved on archive
-refs — see §4 entries "build #10nob868" / "build #11noextable" below.
+SYSCFG.SNP_EN is set per-CPU), and a second separate row that split rows
+#17 / #18 from this session's earlier two-commit form — squashed into the
+single `2a624399c` row here for cleaner review. All removed patches are
+preserved on archive refs — see §4 entries below.
 
 | #  | SHA (short) | Subject | Touches |
 |----|-------------|---------|---------|
@@ -70,30 +72,63 @@ refs — see §4 entries "build #10nob868" / "build #11noextable" below.
 | 14 | `9aebf31e2` | iommu/amd: Don't clear CC_ATTR_HOST_SEV_SNP when running virtualized | iommu/amd/init.c |
 | 15 | `82dc8d7ee` | KVM: SVM: Keep lbrv enabled when running on a hypervisor | kvm/svm/svm.c |
 | 16 | `218669e5d` | crypto: ccp - Skip TMR allocation when PSP_QUIRK_SNP_ONLY is set | sev-dev.c |
-| 17 | `82f5394c6` | x86/sev: invoke snp_rmptable_init on Hyper-V nested SNP host | sev.c |
-| 18 | `5fee34c93` | x86/sev: set SYSCFG.SNP_EN on each CPU for nested Hyper-V soft RMP | sev.c |
+| 17 | `2a624399c` | x86/sev: enable nested Hyper-V SNP soft RMP host on 6.17 (init + SYSCFG.SNP_EN) | sev.c |
 
-(Note: SHAs `82f5394c6` and `5fee34c93` are rebased equivalents of
-`2504290f6` and `3d41cdc9b` after dropping `1b0402d1d` —
-themselves rebased equivalents of `371e6b424` and `b33f4a17f` after
-dropping `b868e81ee`.)
+(Note: `2a624399c` is the squashed form of two earlier separate commits
+`82f5394c6` and `5fee34c93` — same code, fewer commits.  Those in turn
+were rebased equivalents of `2504290f6`/`3d41cdc9b` after dropping
+`1b0402d1d`, themselves rebased from `371e6b424`/`b33f4a17f` after
+dropping `b868e81ee`.  The 2-commit form is preserved on the
+`nested-snp-port-6.17-2-patches` ref on the fork in case anyone wants
+to see the bisect history.)
 
-#1–14 are ports of jepio's patches with minor refactoring to fit 6.17 APIs (most diffs were either context-only or a one-line type rename). #15 is a port of jepio's KVM patch. #16, 17, 18 are **new** patches written in this session to unblock the L0 contract on the Azure SKU.
+#1–14 are ports of jepio's patches with minor refactoring to fit 6.17 APIs (most diffs were either context-only or a one-line type rename). #15 is a port of jepio's KVM patch. #16 is a new patch that uses jepio's PSP_QUIRK framework but does the TMR skip. #17 is **the one new patch written in this session** to make jepio's stack functional on Ubuntu 25.10's 6.17 base.
 
-### 3.1 Patches we wrote (not in jepio)
+### 3.1 The one new patch we wrote (and why jepio didn't need it)
 
-Two of the commits that ship in the minimal stack were authored during this
-session because they fixed bugs not present in jepio's environment:
+Patch #17 (`2a624399c`) is a single combined fix that addresses **two upstream Linux kernel evolutions** between jepio's base (~6.7-rc6-next) and Ubuntu 25.10's 6.17 base. The L0 (Azure Hyper-V) is identical in both cases; the forcing functions are entirely on the L1 kernel side.
 
-- **`82f5394c6` Invoke snp_rmptable_init on Hyper-V nested SNP host.** Wires a `device_initcall` that calls `snp_rmptable_init()` when `snp_soft_rmptable()` is true so the L1 actually allocates and initialises the soft RMP. Without this the existing init path is only triggered from `iommu_snp_enable()` which never runs under nested Hyper-V (no AMD IOMMU / IVRS table).
-- **`5fee34c93` Set SYSCFG.SNP_EN on each CPU.** The critical missing piece. The PSP / L0 contract requires that the *calling CPU* has `SYSCFG.SNP_EN` (bit 24 of MSR 0xc0010010) asserted before any `virt_rmpupdate`/`virt_psmash` MSR will be intercepted as a real RMP write. On bare metal, `init_amd()` does this. Under nested Hyper-V the kernel skips that path because it thinks it's a guest. The fix registers a cpuhp callback that re-runs the SNP_EN bit-set on every CPU online event.
+**Evolution 1: `snp_rmptable_init()` lost its initcall registration.**
+In jepio's base, `arch/x86/kernel/sev.c` (later moved to `arch/x86/virt/svm/sev.c`) registered `snp_rmptable_init()` directly: `fs_initcall(snp_rmptable_init);`. It ran at boot regardless of whether an AMD IOMMU was present.
+
+Upstream Linux removed that `fs_initcall` and made `snp_rmptable_init()` reachable only from `iommu_snp_enable()` (drivers/iommu/amd/init.c:3381). The motivation was an ordering bug — on real bare-metal systems, the IOMMU driver's SNP support needs to be enabled *before* the soft RMP is initialised, so the kernel maintainers tied the two together via a direct call.
+
+But Azure Hyper-V does **not expose an AMD IOMMU** to the L1 VM (no `IVRS` ACPI table, no `amd-vi` device). So in 6.17 `iommu_snp_enable()` never runs → `snp_rmptable_init()` never runs → no soft RMP → PSP later rejects `SNP_GCTX_CREATE` with `INVALID_PLATFORM_STATE`. Jepio's stack didn't see this because his `fs_initcall` fired regardless of IOMMU presence.
+
+**Evolution 2: the soft-RMP early-return inadvertently skips per-CPU SNP_EN.**
+In jepio's base, `snp_rmptable_init()` always called `__snp_enable(smp_processor_id())` on the BSP plus `cpuhp_setup_state(... __snp_enable ...)` for APs. `__snp_enable()` is the function that sets `MSR_AMD64_SYSCFG_SNP_EN` (bit 24) on each CPU.
+
+Jepio's own port patch `5fc96806a` "Maintain shadow rmptable on Hyper-V" (which is also in our stack) added an early-return at the top of `snp_rmptable_init()`:
+
+```c
+int __init snp_rmptable_init(void)
+{
+    ...
+    if (snp_soft_rmptable()) {
+        /* allocate the segment table, zero it, return */
+        return 0;     // <- soft-RMP early-return
+    }
+    /* original hardware-SNP path: __snp_enable() cpuhp_setup_state, etc. */
+}
+```
+
+On the soft-RMP path that early-return bypasses the per-CPU `__snp_enable()` registration — so on Hyper-V no CPU ever gets SYSCFG.SNP_EN set. Hyper-V (L0) only starts intercepting the `virt_rmpupdate` / `virt_psmash` MSRs once `SYSCFG.SNP_EN` is asserted on the calling CPU; until then those MSR writes raise `#GP` and RMP transitions silently fall back to the shadow only, leaving real RMP entries in the default state.
+
+Jepio didn't trip this because his kernel didn't have the `snp_soft_rmptable()` early-return yet (he authored it later in his series, but his own testbed never exercised an end-to-end nested SNP guest launch via `SNP_GCTX_CREATE` — only kernel-init-time dmesg sanity).
+
+**The fix (`2a624399c`):**
+- Adds `__snp_enable_hv()` — a fault-safe variant of `__snp_enable` that sets only bit 24 (not `SNP_VMPL_EN`, which is unverified in the nested context) via `wrmsrq_safe` / `rdmsrq_safe`.
+- Registers it via `cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, ...)` inside the `snp_soft_rmptable()` branch so the bit gets set on every CPU online event.
+- Adds `snp_rmptable_init_hv()` as a `device_initcall` that calls `snp_rmptable_init()` when `snp_soft_rmptable()` is true — replacing the `fs_initcall` upstream dropped.
+
+**Why one patch instead of two:** the changes were originally landed as two commits (`82f5394c6` for the initcall, `5fee34c93` for the cpuhp callback). They're combined here because they're a single conceptual fix (and would be reviewed as such upstream): both are *consequences* of the soft-RMP path no longer being a first-class citizen in mainline.
 
 Two earlier patches were written and shipped but **dropped from the minimal stack** after they proved dormant once SYSCFG.SNP_EN was being set per-CPU:
 
-- **`b868e81ee` Fall back to soft RMP when virt_rmpupdate/psmash #GP** — shipped in builds 1–9. Dropped in build #10nob868 once `3d41cdc9b`/`5fee34c93` made the WRMSRs succeed. Verified the fallback never fires. Preserved on the `master-with-b868-archive` tag.
-- **`1b0402d1d` Make virt_rmpupdate/virt_psmash WRMSR fault-safe** — shipped in builds 5–10. Dropped in build #11noextable. With `5fee34c93` ensuring SYSCFG.SNP_EN is set on every CPU before any `virt_rmpupdate`/`virt_psmash` runs, the underlying #GP path no longer exists in the happy path; iter-3 dmesg shows zero `_ASM_EXTABLE_TYPE_REG` hits and the SNP guest boots cleanly. Preserved on the `master-with-1b04-archive` branch / `nested-snp-port-6.17-with-extable` ref on the fork.
+- **`b868e81ee` Fall back to soft RMP when virt_rmpupdate/psmash #GP** — shipped in builds 1–9. Dropped in build #10nob868 once the SNP_EN per-CPU fix made the WRMSRs succeed. Verified the fallback never fires. Preserved on the `master-with-b868-archive` tag.
+- **`1b0402d1d` Make virt_rmpupdate/virt_psmash WRMSR fault-safe** — shipped in builds 5–10. Dropped in build #11noextable. With SYSCFG.SNP_EN set on every CPU before any `virt_rmpupdate`/`virt_psmash` runs, the underlying #GP path no longer exists in the happy path; iter-3 dmesg shows zero `_ASM_EXTABLE_TYPE_REG` hits and the SNP guest boots cleanly. Preserved on the `master-with-1b04-archive` branch / `nested-snp-port-6.17-with-extable` ref on the fork.
 
-The last patch (`5fee34c93`) is what unlocked the boot. Before it: L0 #GP'd every `virt_rmpupdate`, soft RMP got out of sync with reality, PSP rejected `SNP_GCTX_CREATE` with `INVALID_PLATFORM_STATE`. After it: L0 starts intercepting RMP writes for real, shadow stays consistent, PSP accepts the GCTX and the guest boots.
+Patch #17 (`2a624399c`) is the one that unlocked the boot. Before it: L0 #GP'd every `virt_rmpupdate`, soft RMP got out of sync with reality, PSP rejected `SNP_GCTX_CREATE` with `INVALID_PLATFORM_STATE`. After it: L0 starts intercepting RMP writes for real, shadow stays consistent, PSP accepts the GCTX and the guest boots.
 
 ## 4. Iteration timeline (what we learned the hard way)
 
@@ -147,7 +182,7 @@ apt source linux-image-6.17.0-23-generic            # creates linux-6.17.0-23.23
 cd linux-6.17.0-23.23
 git init && git add -A && git commit -q -m "ubuntu 25.10 6.17.0-23.23 base"
 
-# 2. apply the 18-patch stack (this report's `master` branch)
+# 2. apply the 17-patch stack (this report's `master` branch)
 #    Patches live in /datadrive/nested_openvmm/host-kernel-6.17/patches/ (or
 #    cherry-pick from the working tree under HEAD).
 git am /datadrive/nested_openvmm/host-kernel-6.17/patches/00*-*.patch
@@ -257,12 +292,15 @@ That's the entire happy path.
 - **Soft-RMP-only paths** still leave the real L0 RMP entries in default state for some pages — fine for the GCTX_CREATE → LAUNCH_UPDATE happy-path but probably not for live migration, page sharing, or guest-mediated RMP updates. Worth auditing each WRMSR call site to confirm the shadow is the source of truth.
 - **`CONFIG_DEBUG_INFO=y`** adds ~30 min per build. Keep on for now because the next debugging round will need it (kgdb / crash on guest live-migration etc.).
 - **OpenVMM MP** works on Chris's latest (HEAD `eced60b7`). The 60s timeout in the repro shows guest reaching userspace on 1 vCPU; bumping `-p 2` and re-running is the next validation.
-- **The 2 new patches** (`82f5394c6` snp_rmptable_init initcall, `5fee34c93` SYSCFG.SNP_EN cpuhp callback) should be sent upstream / to the jepio tree. They are written narrowly for the Hyper-V nested case and gated on `cpu_feature_enabled(X86_FEATURE_NESTED_VIRT_SNP_MSR)` / `snp_soft_rmptable()`, so they should be safe even on non-nested SNP hosts. Two patches that were originally written but proved redundant once SYSCFG.SNP_EN is set per-CPU are preserved on archive refs in case future L0 changes resurrect the WRMSR-#GP path: `b868e81ee` (soft-RMP fallback on WRMSR #GP) on the `master-with-b868-archive` tag, and `1b0402d1d` (extable wrapper around WRMSR) on the `master-with-1b04-archive` branch / `nested-snp-port-6.17-with-extable` ref on the fork.
+- **The one new patch** (`2a624399c` — `snp_rmptable_init` device_initcall + per-CPU SYSCFG.SNP_EN via cpuhp) should be sent upstream / to the jepio tree. It is narrowly written for the Hyper-V nested case and gated on `snp_soft_rmptable()`, so it is safe on non-nested SNP hosts (the initcall becomes a no-op there). Three earlier candidates were tested and dropped from the minimal stack — preserved on archive refs in case future L0/kernel changes resurrect the underlying failure modes:
+  - `b868e81ee` (soft-RMP fallback on WRMSR #GP) on `master-with-b868-archive` / `nested-snp-port-6.17-with-b868`,
+  - `1b0402d1d` (extable wrapper around WRMSR) on `master-with-1b04-archive` / `nested-snp-port-6.17-with-extable`,
+  - the unsquashed 2-commit form of `2a624399c` on `nested-snp-port-6.17-2-patches` (`82f5394c6` + `5fee34c93`).
 - **Migration/teardown path** for the new RMP allocator — when the guest exits, do we properly walk the soft RMP and reset shadow entries? Not yet exercised.
 
 ## 9. Artifacts (in `/datadrive/nested_openvmm/`)
 
-- `host-kernel-6.17/ubuntu-source/linux-6.17.0-23.23/` — full patched source tree (HEAD `5fee34c93`, branch `master`; archives at `master-with-b868-archive` tag `b33f4a17f` and `master-with-1b04-archive` branch `3d41cdc9b`).
+- `host-kernel-6.17/ubuntu-source/linux-6.17.0-23.23/` — full patched source tree (HEAD `2a624399c`, branch `master`; archives at `master-with-b868-archive` tag `b33f4a17f`, `master-with-1b04-archive` branch `3d41cdc9b`, and `master-with-2-separate-patches` branch `5fee34c93`).
 - `host-kernel-6.17/ubuntu-source/linux-*-g5fee34c93-11noextable_amd64.deb` — installed kernel debs.
 - `openvmm/` — OpenVMM checkout on branch `openvmm_nested_snp`
   (HEAD `10d28c05`, tracking `chris-oo/openvmm-snp`).
@@ -336,7 +374,7 @@ themselves.
 | vCPUs / RAM | 1 / 1024 MB | 2 / 256 MB |
 | Firmware | AmdSev OVMF (UEFI) → Linux | Direct bzImage entry (no firmware) |
 | vsock transport | `vhost-vsock-pci`, AF_VSOCK on host, CID 42 | virtio-vsock over PCIe + Unix-socket relay (`/tmp/openvmm-vsock_<port>`) |
-| Host kernel | 6.7.0-rc6-next SNP-host (jepio's stack) | 6.17.0-23-generic + this report's 18-patch stack (nested-SNP) |
+| Host kernel | 6.7.0-rc6-next SNP-host (jepio's stack) | 6.17.0-23-generic + this report's 17-patch stack (nested-SNP) |
 
 ### 11.3 Why QEMU needs OVMF and OpenVMM doesn't
 
