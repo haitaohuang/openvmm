@@ -181,15 +181,20 @@ Boot an SNP guest:
 
 ```bash
 # uses snp-artifacts/{openvmm, vmlinuz-6.17.0-23-generic, initrd}
+# IMPORTANT: openvmm writes the guest serial console + its own tracing
+# to STDERR. Use `2>&1` (or `|&` in bash 4+) to capture both.
 sudo timeout 60 /datadrive/nested_openvmm/snp-artifacts/run-snp-openvmm.sh \
-    | tee /datadrive/nested_openvmm/openvmm-run.log
+    2>&1 | tee /datadrive/nested_openvmm/openvmm-run.log
 
-# expect L2 dmesg in the log:
+# expect L2 dmesg in the log (these come from STDERR):
 #   Memory Encryption Features active: AMD SEV SEV-ES SEV-SNP
 #   SEV: SNP running at VMPL0.
 #   smp: Bringing up secondary CPUs ...           # MP (2 vCPUs)
 #   virtio_blk virtio0: 1/0/0 default/read/poll queues   # PCIe virtio-blk
 #   HELLO WORLD APP RUNNING IN SNP GUEST
+#
+# If you only see the "Running: env OPENVMM_LOG=..." line and nothing
+# else, you forgot `2>&1` and only captured stdout.
 ```
 
 That's the entire happy path.
