@@ -177,25 +177,55 @@ PCIe virtio devices in the guest. The default `run-snp-openvmm.sh` in
 this HEAD now wires a virtio-blk-over-PCIe device and runs 2 vCPUs to
 exercise both code paths.
 
-Boot an SNP guest:
+Boot an SNP guest. Two recipes work, depending on what you need:
+
+**Option A — interactive (richest output, best for first run):**
 
 ```bash
 # uses snp-artifacts/{openvmm, vmlinuz-6.17.0-23-generic, initrd}
-# IMPORTANT: openvmm writes the guest serial console + its own tracing
-# to STDERR. Use `2>&1` (or `|&` in bash 4+) to capture both.
-sudo timeout 60 /datadrive/nested_openvmm/snp-artifacts/run-snp-openvmm.sh \
-    2>&1 | tee /datadrive/nested_openvmm/openvmm-run.log
+# Run with a real TTY so the guest serial flows straight to your terminal.
+sudo /datadrive/nested_openvmm/snp-artifacts/run-snp-openvmm.sh
+# Wait ~50 s for SNP LAUNCH_UPDATE to finish, then watch the guest boot.
+# Hit Ctrl-A x to quit, or Ctrl-C twice.
+```
 
-# expect L2 dmesg in the log (these come from STDERR):
+**Option B — captured-to-file (recommended for repro / autopilot):**
+
+```bash
+# uses snp-artifacts/{openvmm, vmlinuz-6.17.0-23-generic, initrd}
+# IMPORTANT: 60 s is the minimum. SNP LAUNCH_UPDATE alone takes ~45 s
+# on this hardware; the guest only reaches userspace around 50–55 s.
+sudo timeout 60 /datadrive/nested_openvmm/snp-artifacts/run-snp-openvmm.sh \
+    > /datadrive/nested_openvmm/openvmm-run.log 2>&1
+
+# expect L2 dmesg in the log (openvmm writes serial+trace to STDERR;
+# the redirect captures both into the same file):
 #   Memory Encryption Features active: AMD SEV SEV-ES SEV-SNP
 #   SEV: SNP running at VMPL0.
 #   smp: Bringing up secondary CPUs ...           # MP (2 vCPUs)
 #   virtio_blk virtio0: 1/0/0 default/read/poll queues   # PCIe virtio-blk
 #   HELLO WORLD APP RUNNING IN SNP GUEST
-#
-# If you only see the "Running: env OPENVMM_LOG=..." line and nothing
-# else, you forgot `2>&1` and only captured stdout.
 ```
+
+**Option C — clean serial-only log (no trace noise):**
+
+```bash
+# patch run-snp-openvmm.sh to use --com1 file=PATH instead of --com1 console:
+#   --com1 file=/datadrive/nested_openvmm/openvmm-serial.log
+# then run normally:
+sudo timeout 60 /datadrive/nested_openvmm/snp-artifacts/run-snp-openvmm.sh
+# guest serial ends up in openvmm-serial.log (~400 lines, no trace mixed in).
+```
+
+**Pitfalls — these do NOT work:**
+
+- `… 2>&1 | tee log` — the pipe blocks openvmm's mesh-spawned worker
+  from emitting most output; you'll see the first ~50 s of trace logs
+  and *no* guest dmesg, regardless of how long the timeout is.
+- `sudo timeout 30 …` — too short. SNP LAUNCH_UPDATE on the kernel +
+  initrd images alone runs ~45 s before the first vCPU starts. Use 60 s
+  or more.
+- Running without `sudo` — KVM_SNP_LAUNCH_* ioctls require root.
 
 That's the entire happy path.
 
