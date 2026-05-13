@@ -38,7 +38,16 @@ This document is the post-mortem of that loop: what the patches do, why they wer
 
 ## 3. Final patch stack on top of `linux-6.17.0-23.23`
 
-19 commits, in apply order. (`git log --reverse` on `/datadrive/nested_openvmm/host-kernel-6.17/ubuntu-source/linux-6.17.0-23.23`.)
+19 commits in the **minimal** functional stack, in apply order. (`git log --reverse`
+on `/datadrive/nested_openvmm/host-kernel-6.17/ubuntu-source/linux-6.17.0-23.23`,
+branch `master` HEAD `3d41cdc9b`. The actual git log additionally contains
+4 early platform-PSP infrastructure commits — ACPI ASPT helper, Hyper-V PSP
+platform-device registration, PSP IRQ support, CCP bind to platform PSP —
+that are unchanged ports of jepio's series and not surfaced in the table.)
+An earlier 20-row table existed on the `master-with-b868-archive` tag with a
+20th entry `b868e81ee` (soft-RMP fallback on WRMSR #GP); it was removed after
+build #10nob868 confirmed the fallback is dead code in the happy path — see
+§4 entry "build #10nob868" below.
 
 | #  | SHA (short) | Subject | Touches |
 |----|-------------|---------|---------|
@@ -59,22 +68,26 @@ This document is the post-mortem of that loop: what the patches do, why they wer
 | 15 | `82dc8d7ee` | KVM: SVM: Keep lbrv enabled when running on a hypervisor | kvm/svm/svm.c |
 | 16 | `218669e5d` | crypto: ccp - Skip TMR allocation when PSP_QUIRK_SNP_ONLY is set | sev-dev.c |
 | 17 | `1b0402d1d` | x86/sev: Make virt_rmpupdate/virt_psmash WRMSR fault-safe | sev.c |
-| 18 | `b868e81ee` | x86/sev: fall back to soft RMP when virt_rmpupdate/psmash #GP | sev.c |
-| 19 | `371e6b424` | x86/sev: invoke snp_rmptable_init on Hyper-V nested SNP host | sev.c |
-| 20 | `b33f4a17f` | x86/sev: set SYSCFG.SNP_EN on each CPU for nested Hyper-V soft RMP | sev.c |
+| 18 | `2504290f6` | x86/sev: invoke snp_rmptable_init on Hyper-V nested SNP host | sev.c |
+| 19 | `3d41cdc9b` | x86/sev: set SYSCFG.SNP_EN on each CPU for nested Hyper-V soft RMP | sev.c |
 
-#1–14 are ports of jepio's patches with minor refactoring to fit 6.17 APIs (most diffs were either context-only or a one-line type rename). #15 is a port of jepio's KVM patch. #16–20 are **new** patches written in this session to unblock the L0 contract on the Azure SKU.
+(Note: SHAs `2504290f6` and `3d41cdc9b` are rebased equivalents of
+`371e6b424` and `b33f4a17f` after dropping `b868e81ee`.)
+
+#1–14 are ports of jepio's patches with minor refactoring to fit 6.17 APIs (most diffs were either context-only or a one-line type rename). #15 is a port of jepio's KVM patch. #16, 17, 18, 19 are **new** patches written in this session to unblock the L0 contract on the Azure SKU.
 
 ### 3.1 Patches we wrote (not in jepio)
 
-Four of the commits were authored during this session because they fixed bugs not present in jepio's environment:
+Three of the commits that ship in the minimal stack were authored during this
+session because they fixed bugs not present in jepio's environment:
 
-- **`1b0402d1d` Make virt_rmpupdate/virt_psmash WRMSR fault-safe.** L0 in Azure delivers a `#GP` to the L1 instead of silently returning success when the prerequisites aren't met. The original jepio code used a plain `wrmsrl()` which converts that #GP into an oops. Switched to `wrmsrl_safe()` (with an extable entry in the inline asm) so we can detect and recover.
-- **`b868e81ee` Fall back to soft RMP when virt_rmpupdate/psmash #GP.** Building on #17: when L0 refuses the WRMSR, fall back to writing only the soft shadow RMP entry. This is "good enough" for any code path that only inspects the shadow (e.g., the PSP-driven launch path needs the shadow state correct so that page validation succeeds).
-- **`371e6b424` Invoke snp_rmptable_init on Hyper-V nested SNP host.** Wires the `mshyperv` Hyper-V detection path to call `snp_rmptable_init()` so that the L1 actually allocates and initializes the soft RMP. Without this the existing init path is only triggered on bare metal.
-- **`b33f4a17f` Set SYSCFG.SNP_EN on each CPU.** The critical missing piece. The PSP / L0 contract requires that the *calling CPU* has `SYSCFG.SNP_EN` (bit 24 of MSR 0xc0010010) asserted before any `virt_rmpupdate`/`virt_psmash` MSR will be intercepted as a real RMP write. On bare metal, `init_amd()` does this. Under nested Hyper-V the kernel skips that path because it thinks it's a guest. The fix registers a cpuhp callback that re-runs the SNP_EN bit-set on every CPU online event.
+- **`1b0402d1d` Make virt_rmpupdate/virt_psmash WRMSR fault-safe.** L0 in Azure delivers a `#GP` to the L1 instead of silently returning success when the prerequisites aren't met. The original jepio code used a plain `wrmsrl()` which converts that #GP into an oops. Switched to an extable-protected inline `wrmsr` (`_ASM_EXTABLE_TYPE_REG(.., EX_TYPE_WRMSR_SAFE, ..)`) so we can detect and recover. Once `b33f4a17f` (below) is in place these WRMSRs no longer #GP, but the wrapper is kept as a cheap safety net.
+- **`2504290f6` Invoke snp_rmptable_init on Hyper-V nested SNP host.** Wires a `device_initcall` that calls `snp_rmptable_init()` when `snp_soft_rmptable()` is true so the L1 actually allocates and initialises the soft RMP. Without this the existing init path is only triggered from `iommu_snp_enable()` which never runs under nested Hyper-V (no AMD IOMMU / IVRS table).
+- **`3d41cdc9b` Set SYSCFG.SNP_EN on each CPU.** The critical missing piece. The PSP / L0 contract requires that the *calling CPU* has `SYSCFG.SNP_EN` (bit 24 of MSR 0xc0010010) asserted before any `virt_rmpupdate`/`virt_psmash` MSR will be intercepted as a real RMP write. On bare metal, `init_amd()` does this. Under nested Hyper-V the kernel skips that path because it thinks it's a guest. The fix registers a cpuhp callback that re-runs the SNP_EN bit-set on every CPU online event.
 
-The last patch is what unlocked the boot. Before it: L0 #GP'd every `virt_rmpupdate`, soft RMP got out of sync with reality, PSP rejected `SNP_GCTX_CREATE` with `INVALID_PLATFORM_STATE`. After it: L0 starts intercepting RMP writes for real, shadow stays consistent, PSP accepts the GCTX and the guest boots.
+A fourth patch — **`b868e81ee` Fall back to soft RMP when virt_rmpupdate/psmash #GP** — was written and shipped in builds 1–9. It is **not** in the minimal stack because once `3d41cdc9b` is in place the WRMSRs succeed and the fallback never fires; build #10nob868 verified the SNP guest still boots end-to-end without it (see §4).
+
+The last patch (`3d41cdc9b`) is what unlocked the boot. Before it: L0 #GP'd every `virt_rmpupdate`, soft RMP got out of sync with reality, PSP rejected `SNP_GCTX_CREATE` with `INVALID_PLATFORM_STATE`. After it: L0 starts intercepting RMP writes for real, shadow stays consistent, PSP accepts the GCTX and the guest boots.
 
 ## 4. Iteration timeline (what we learned the hard way)
 
@@ -89,6 +102,7 @@ Builds were numbered 1–9 (each build = one reboot). The journey:
   - L1 dmesg: `SEV-SNP: Soft RMP table initialised; SYSCFG.SNP_EN set on all CPUs` and `kvm_amd: SEV-SNP enabled (ASIDs 1 - 64)`.
   - L2 dmesg: `Memory Encryption Features active: AMD SEV SEV-ES SEV-SNP`, `SEV: SNP running at VMPL0.`, `SEV: SNP guest platform devices initialized.`
   - L2 userspace: `HELLO WORLD APP RUNNING IN SNP GUEST`.
+- **Build #10nob868** (minimality test): drop `b868e81ee` (soft-RMP fallback on WRMSR #GP) from the stack, rebase, rebuild, reboot. Hypothesis: now that `b33f4a17f` makes the WRMSRs succeed, the fallback is dormant and removable. Verified: SNP guest boots end-to-end with the same outcomes as build #9 (HELLO WORLD, MP, virtio_blk, no `falling back to soft RMP table only` messages, no #GP / extable hits). Result: `master` branch updated to drop the patch; the original stack is preserved on the `master-with-b868-archive` tag for reference.
 
 ## 5. Diagnostic techniques that paid off
 
@@ -126,7 +140,7 @@ apt source linux-image-6.17.0-23-generic            # creates linux-6.17.0-23.23
 cd linux-6.17.0-23.23
 git init && git add -A && git commit -q -m "ubuntu 25.10 6.17.0-23.23 base"
 
-# 2. apply the 20-patch stack (from this session's tree)
+# 2. apply the 19-patch stack (this report's `master` branch)
 #    Patches live in /datadrive/nested_openvmm/host-kernel-6.17/patches/ (or
 #    cherry-pick from the working tree under HEAD).
 git am /datadrive/nested_openvmm/host-kernel-6.17/patches/00*-*.patch
@@ -236,7 +250,7 @@ That's the entire happy path.
 - **Soft-RMP-only paths** still leave the real L0 RMP entries in default state for some pages — fine for the GCTX_CREATE → LAUNCH_UPDATE happy-path but probably not for live migration, page sharing, or guest-mediated RMP updates. Worth auditing each WRMSR call site to confirm the shadow is the source of truth.
 - **`CONFIG_DEBUG_INFO=y`** adds ~30 min per build. Keep on for now because the next debugging round will need it (kgdb / crash on guest live-migration etc.).
 - **OpenVMM MP** works on Chris's latest (HEAD `eced60b7`). The 60s timeout in the repro shows guest reaching userspace on 1 vCPU; bumping `-p 2` and re-running is the next validation.
-- **The 4 new patches** (1b0402d1d, b868e81ee, 371e6b424, b33f4a17f) should be sent upstream / to the jepio tree. They are written narrowly for the Hyper-V nested case and gated on `cpu_feature_enabled(X86_FEATURE_NESTED_VIRT_SNP_MSR)`, so they should be safe even on non-nested SNP hosts.
+- **The 3 new patches** (1b0402d1d, 2504290f6, 3d41cdc9b) should be sent upstream / to the jepio tree. They are written narrowly for the Hyper-V nested case and gated on `cpu_feature_enabled(X86_FEATURE_NESTED_VIRT_SNP_MSR)` / `snp_soft_rmptable()`, so they should be safe even on non-nested SNP hosts. A 4th patch (`b868e81ee` soft-RMP fallback on WRMSR #GP) was originally written but proved redundant after `3d41cdc9b` and is preserved on the `master-with-b868-archive` tag in case future L0 changes resurrect the WRMSR-#GP path.
 - **Migration/teardown path** for the new RMP allocator — when the guest exits, do we properly walk the soft RMP and reset shadow entries? Not yet exercised.
 
 ## 9. Artifacts (in `/datadrive/nested_openvmm/`)
@@ -282,5 +296,87 @@ Outcome: guest still boots; additionally now sees
 2 vCPUs) and `virtio_blk virtio0: 1/0/0 default/read/poll queues`
 (PCIe virtio-blk works in SNP guest). Full log:
 `openvmm-run-20260513T161202Z-postsync.log`.
+
+## 11. QEMU vs OpenVMM enclave demo — what's identical, what isn't
+
+The repo ships two end-to-end enclave demos that exercise the same
+guest application (`enclave-init` doing two-way ecall/ocall + real
+PSP-signed attestation over virtio-vsock) under two different VMMs:
+
+- `demo.sh` + `launch-snp.sh` → QEMU + AmdSev OVMF (legacy path, SNP host kernel)
+- `demo-openvmm.sh` + `launch-snp-openvmm.sh` → OpenVMM (this report's path, nested-SNP host kernel)
+
+### 11.1 Guest payload — bit-for-bit identical
+
+Both launchers `-kernel`/`--kernel` and `-initrd`/`--initrd` the same
+two files from `/datadrive2/work/`:
+
+| File | Sha256 | Size |
+|---|---|---|
+| `OHCL-Linux-Kernel/arch/x86/boot/bzImage` | `765e07d1eaca4c15c23a9ecc0e3d02e03b43dfab98613b34333f96fd6ad6fe6e` | 13,730,304 B |
+| `initramfs.cpio.gz` (contains `enclave-init` as `/init`) | `c77ce8d5932f7f2fe68fd89400b8a299adc66a264a7a764fc5e378b8ed85792f` | 260,168 B |
+
+So the OHCL kernel binary and the entire guest userspace are the same
+inputs to the PSP on both demos. Any difference in what the PSP measures
+comes from the **launch surface around** these files, not from the files
+themselves.
+
+### 11.2 Launch surface differences
+
+| Aspect | QEMU (`launch-snp.sh`) | OpenVMM (`launch-snp-openvmm.sh`) |
+|---|---|---|
+| Kernel cmdline (default) | `console=ttyS0 earlyprintk=serial panic=10 init=/init swiotlb=force` | `console=ttyS0 earlyprintk=serial earlycon panic=-1` |
+| vCPUs / RAM | 1 / 1024 MB | 2 / 256 MB |
+| Firmware | AmdSev OVMF (UEFI) → Linux | Direct bzImage entry (no firmware) |
+| vsock transport | `vhost-vsock-pci`, AF_VSOCK on host, CID 42 | virtio-vsock over PCIe + Unix-socket relay (`/tmp/openvmm-vsock_<port>`) |
+| Host kernel | 6.7.0-rc6-next SNP-host (jepio's stack) | 6.17.0-23-generic + this report's 19-patch stack (nested-SNP) |
+
+### 11.3 Why QEMU needs OVMF and OpenVMM doesn't
+
+SEV-SNP guests must enter execution from **measured, encrypted memory at
+the reset vector**. The launch measurement is whatever the PSP hashes
+between `SNP_LAUNCH_START` and `SNP_LAUNCH_FINISH`, and the guest's first
+instruction has to come from one of those measured pages. The two VMMs
+satisfy this differently:
+
+- **QEMU + AmdSev OVMF flow.** QEMU itself has no SNP-aware Linux
+  trampoline. AmdSev OVMF (a special SEV-SNP build of EDK2) is loaded
+  into the guest reset vector and hashed by the PSP into the launch
+  digest. OVMF runs `PVALIDATE` on the rest of guest memory, then reads
+  the `-kernel`/`-initrd`/`-append` blobs out of QEMU's `fw_cfg`
+  pseudo-device, hashes them into a measured "kernel hash table" /
+  secrets page, and chain-loads Linux. The PSP launch digest therefore
+  covers **OVMF only**; bzImage/initrd/cmdline are bound *indirectly*
+  through OVMF's own verified hash chain.
+- **OpenVMM direct-boot flow.** OpenVMM is SNP-aware in-process. It
+  loads bzImage + initrd + the Linux boot params (zero page /
+  `setup_header`) into guest memory itself, drives `SNP_LAUNCH_UPDATE`
+  so the PSP measures those pages, and at `SNP_LAUNCH_FINISH` the guest
+  starts directly at Linux's 64-bit entry. The "measured loader" role
+  AmdSev OVMF plays for QEMU is built into the VMM. Firmware would be
+  redundant.
+
+### 11.4 Consequence for attestation surface
+
+Because the two demos hand the PSP different bytes, the launch
+measurement field in the SNP attestation report differs **even though
+the kernel and initrd binaries are identical**:
+
+| Demo | Launch measurement covers | To verify "this exact kernel ran" you must also check |
+|---|---|---|
+| QEMU + OVMF | The AmdSev OVMF blob bytes | The kernel-hash-table / secrets page OVMF builds at runtime, transitively |
+| OpenVMM direct boot | bzImage + initrd + cmdline + boot params | Nothing further — the measurement itself binds the kernel/initrd bytes |
+
+In practice OpenVMM's surface is the simpler attestation story for an
+enclave demo: a relying party that knows the expected `bzImage` +
+`initramfs.cpio.gz` + cmdline can compute the expected launch digest
+deterministically and compare it to the PSP report's `MEASUREMENT`
+field. With the QEMU+OVMF path the relying party must instead trust
+OVMF and verify the indirected hash chain it builds.
+
+Other measurement-relevant fields in the SNP report (Policy, VMPL,
+`HOST_DATA`, `ID_KEY_DIGEST`) are not affected by the choice of VMM
+in this repo — both demos use the default policy and don't populate
+host-data.
 
 — *end of report —*
