@@ -113,6 +113,8 @@ vmswitch.workspace = true
 vfio_assigned_device.workspace = true
 vfio_assigned_device_resources.workspace = true
 vmgs_broker = { workspace = true, features = ["encryption"] }
+pal.workspace = true
+
 
 [build-dependencies]
 build_rs_guest_arch.workspace = true

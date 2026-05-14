@@ -579,6 +579,27 @@ impl Partition {
     #[cfg(target_arch = "x86_64")]
     pub fn sev_snp_init(&self, sev: BorrowedFd<'_>) -> Result<()> {
         let mut init = kvm_sev_init::default();
+        // Hackathon: opt in to SMT Protection (SEV_FEATURE bit 15) via
+        // env var OPENVMM_SMT_PROTECTION=1. Requires:
+        //   * patched L1 kernel (haitaohuang/linux:smt-protection-dryrun)
+        //   * L0 exposing CPUID Fn8000_001F.EAX[25] (cc_v6+ only)
+        //   * HLT_WAKEUP_ICR MSR virtualization by L0
+        // For attestation/observability: the bit shows up in the SNP
+        // attestation report's sev_features field at byte offset 0x180+0x48.
+        // TODO(handoff): replace env var with a proper CLI flag plumbed
+        //                via openvmm_defs::config::HypervisorConfig.
+        if std::env::var("OPENVMM_SMT_PROTECTION")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            const SEV_FEAT_SMT_PROTECTION: u64 = 1 << 15;
+            init.vmsa_features = SEV_FEAT_SMT_PROTECTION;
+            eprintln!(
+                "openvmm: OPENVMM_SMT_PROTECTION=1 — enabling SEV SMT Protection \
+                 (vmsa_features={:#x})",
+                init.vmsa_features
+            );
+        }
         let mut command = kvm_sev_cmd {
             id: sev_cmd_id_KVM_SEV_INIT2,
             data: std::ptr::from_mut(&mut init) as u64,

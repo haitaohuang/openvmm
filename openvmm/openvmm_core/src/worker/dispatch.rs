@@ -163,6 +163,67 @@ pub fn new_device_thread() -> (JoinHandle<()>, DefaultDriver) {
     DefaultPool::spawn_on_thread("basic_device_thread")
 }
 
+/// Per-VP-thread setup for SEV-SNP SMT Protection (hackathon prototype).
+///
+/// Reads two environment variables:
+///
+/// * `OPENVMM_VP_AFFINITY=<csv>` — comma-separated list of L1 pCPU IDs,
+///   one per vp_index. Pins this VP thread to the corresponding pCPU
+///   so that the kernel can program HLT_WAKEUP_ICR for the SMT sibling.
+///   Example: `OPENVMM_VP_AFFINITY=4` pins vp 0 to pCPU 4 (sibling 5
+///   gets parked when the L2 vCPU runs).
+///
+/// * `OPENVMM_SMT_PROTECTION=1` — also invoke
+///   `prctl(PR_SCHED_CORE, PR_SCHED_CORE_CREATE)` on the VP thread.
+///   This is the userspace half of Linux Core Scheduling: it gives
+///   the VP thread a unique scheduling cookie so the kernel will
+///   refuse to co-schedule any other process's task on the sibling
+///   SMT thread of this VP's pCPU. Without this, only the *guest*
+///   half of the SMT pair is isolated (via HLT_WAKEUP_ICR); the host
+///   sibling can still run unrelated userspace work.
+///
+/// On any failure this logs to stderr and continues — the partition
+/// still boots, but SMT isolation may be partial. The kernel-half of
+/// the protection (HLT_WAKEUP_ICR) is enforced by KVM regardless.
+///
+/// TODO(handoff): replace env vars with proper CLI flags plumbed
+/// through `openvmm_defs::config::HypervisorConfig`. See
+/// `smt-protection-hackathon/openvmm-patches/README.md` for the
+/// production patch sketch.
+#[cfg(target_os = "linux")]
+fn smt_protection_setup_vp_thread(vp_index: usize) {
+    if let Ok(list) = std::env::var("OPENVMM_VP_AFFINITY") {
+        if let Some(spec) = list.split(',').nth(vp_index) {
+            match spec.trim().parse::<u32>() {
+                Ok(cpu) => {
+                    let mut set = pal::unix::affinity::CpuSet::new();
+                    set.set(cpu);
+                    match pal::unix::affinity::set_current_thread_affinity(&set) {
+                        Ok(()) => eprintln!("openvmm: vp{vp_index} pinned to pCPU {cpu}"),
+                        Err(e) => eprintln!("openvmm: vp{vp_index} pin to cpu{cpu} failed: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("openvmm: OPENVMM_VP_AFFINITY[{vp_index}] parse error: {e}"),
+            }
+        }
+    }
+
+    if std::env::var("OPENVMM_SMT_PROTECTION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        match pal::unix::affinity::enable_core_scheduling() {
+            Ok(()) => {
+                eprintln!("openvmm: vp{vp_index} Linux Core Scheduling cookie installed")
+            }
+            Err(e) => eprintln!("openvmm: vp{vp_index} PR_SCHED_CORE_CREATE failed: {e}"),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn smt_protection_setup_vp_thread(_vp_index: usize) {}
+
 impl Manifest {
     fn from_config(config: Config) -> Self {
         Self {
@@ -2326,17 +2387,20 @@ impl InitializedVm {
                 let (send, recv) = mesh::oneshot();
                 thread::Builder::new()
                     .name(format!("vp-{}", vp_index))
-                    .spawn(move || match vp.bind() {
-                        Ok(mut vp) => {
-                            send.send(Ok(()));
-                            block_on_vp(
-                                partition,
-                                VpIndex::new(vp_index as u32),
-                                vp.run(runner, &chipset),
-                            )
-                        }
-                        Err(err) => {
-                            send.send(Err(err));
+                    .spawn(move || {
+                        smt_protection_setup_vp_thread(vp_index);
+                        match vp.bind() {
+                            Ok(mut vp) => {
+                                send.send(Ok(()));
+                                block_on_vp(
+                                    partition,
+                                    VpIndex::new(vp_index as u32),
+                                    vp.run(runner, &chipset),
+                                )
+                            }
+                            Err(err) => {
+                                send.send(Err(err));
+                            }
                         }
                     })
                     .unwrap();

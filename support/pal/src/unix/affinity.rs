@@ -145,6 +145,42 @@ pub fn get_cpu_number() -> u32 {
     unsafe { libc::sched_getcpu() as u32 }
 }
 
+/// Linux Core Scheduling: creates a unique scheduling cookie for the
+/// current thread (`prctl(PR_SCHED_CORE, PR_SCHED_CORE_CREATE,
+/// PIDTYPE_PID, 0)`).
+///
+/// After this returns successfully, the kernel will refuse to co-schedule
+/// any task without the same cookie on the SMT sibling of whichever pCPU
+/// this thread is running on. Combined with hardware-level SEV-SNP SMT
+/// Protection (which parks the sibling via `HLT_WAKEUP_ICR`), this gives
+/// end-to-end SMT isolation for a confidential guest vCPU.
+///
+/// Requires Linux 5.14+ (`CONFIG_SCHED_CORE=y`, on by default in distros).
+///
+/// See `Documentation/admin-guide/hw-vuln/core-scheduling.rst` for the
+/// full kernel reference.
+pub fn enable_core_scheduling() -> io::Result<()> {
+    // From <linux/prctl.h>:
+    const PR_SCHED_CORE: libc::c_int = 62;
+    const PR_SCHED_CORE_CREATE: libc::c_ulong = 1;
+    const PIDTYPE_PID: libc::c_ulong = 0;
+    // SAFETY: calling prctl(2) as documented. All args are scalars; no
+    // memory is read or written by the kernel.
+    let r = unsafe {
+        libc::prctl(
+            PR_SCHED_CORE,
+            PR_SCHED_CORE_CREATE,
+            0_u64, // pid: 0 = current task
+            PIDTYPE_PID,
+            0_u64, // unused
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Returns the total number of online processors.
 pub fn num_procs() -> u32 {
     static NUM_PROCS: OnceLock<u32> = OnceLock::new();
